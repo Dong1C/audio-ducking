@@ -43,8 +43,8 @@ constexpr UINT ID_BTN_TOGGLE       = 1001;        // 替换原 checkbox
 constexpr UINT ID_STATUS_LABEL     = 1002;        // SS_OWNERDRAW 状态指示器
 constexpr UINT ID_SLIDER_FLOAT_BASE = 1100;       // +0..+8 -> 9 个滑块
 constexpr UINT ID_EDIT_FLOAT_BASE   = 1010;       // +0..+8 -> 9 个编辑框
-constexpr UINT ID_EDIT_APPS         = 1019;       // TARGET_MUSIC_APPS
 constexpr UINT ID_BTN_SAVE          = 1020;
+constexpr UINT ID_BTN_APPLY         = 1023;       // 应用 (写盘, 不关闭)
 constexpr UINT ID_BTN_CANCEL        = 1021;
 constexpr UINT ID_STATUS_BAR        = 1022;       // 底部状态栏 (SS_LEFTNOWORDWRAP)
 constexpr UINT ID_TIMER_REFRESH     = 1;          // 100ms 定时器
@@ -58,7 +58,6 @@ constexpr int EDIT_W = 90;
 constexpr int ROW_H = 24;
 constexpr int MARGIN = 10;
 constexpr int HEADER_H = 32;
-constexpr int APPS_H = 70;       // 多行 Edit 高度
 constexpr int STATUS_BAR_H = 26;
 constexpr int BTN_H = 28;
 constexpr int BTN_W = 90;
@@ -68,9 +67,9 @@ constexpr LPCWSTR kSettingsClass  = L"AudioDuckingSettingsWnd";
 constexpr LPCWSTR kSettingsTitle  = L"Audio Ducking — 设置";
 constexpr LPCWSTR kMainWndTitle   = L"AudioDucking";
 
-// settings.json 路径 (与 Config::load 默认一致)
-constexpr LPCWSTR kSettingsPath = L"settings.json";
-constexpr LPCWSTR kSettingsTmp  = L"settings.json.tmp";
+// settings.json 路径 (单点真相, 由 FindSettingsJsonPath() 在窗口创建时解析)
+std::wstring g_settingsPath;                  // 主入口 (默认空 → 用 FindSettingsJsonPath())
+std::wstring g_settingsTmp;                   // 临时文件名 (写入时的 .tmp)
 
 // ───── 工具: utf8 <-> wide ─────
 std::wstring utf8ToWide(const std::string& s) {
@@ -109,23 +108,23 @@ std::string trimAscii(std::string s) {
 }
 
 // ───── 滑块 <-> 数值 转换 ─────
-inline int sliderScaleFor(float min, float max) {
-    float range = max - min;
-    if (range <= 1.0f)  return 1000;     // 0.001 步进
-    if (range <= 10.0f) return 10000;    // 0.001 步进
-    return 36000;                       // 0.1 步进
-}
-
-inline int sliderValueToPos(float v, float min, float max) {
-    int scale = sliderScaleFor(min, max);
-    float norm = (v - min) / (max - min);
+// 注意: 用 (sliderMax - min) 作为映射区间, 而非 (max - min).
+// 这样典型值下 (value <= sliderMax) 滑块手感良好; value > sliderMax 时
+// 自动 clamp 到右端, 用户可通过 Edit 框输入更大值.
+inline int sliderValueToPos(float v, float min, float sliderMax) {
+    int scale = 1000;
+    if (sliderMax <= min) return 0;
+    float norm = (v - min) / (sliderMax - min);
+    if (norm < 0.0f) norm = 0.0f;
+    if (norm > 1.0f) norm = 1.0f;
     return (int)std::lround(norm * scale);
 }
 
-inline float sliderPosToValue(int pos, float min, float max) {
-    int scale = sliderScaleFor(min, max);
+inline float sliderPosToValue(int pos, float min, float sliderMax) {
+    int scale = 1000;
+    if (sliderMax <= min) return min;
     float norm = (float)pos / (float)scale;
-    return min + norm * (max - min);
+    return min + norm * (sliderMax - min);
 }
 
 // ───── 工具: 编辑框读文本 (UTF-8) ─────
@@ -254,18 +253,23 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 
 // ───── 设置窗口创建 ─────
 void CreateSettingsWindow() {
-    // 单例: 若已存在则前置
+    // 解析 settings.json 路径 (CWD 或 exe 目录)
+    if (g_settingsPath.empty()) {
+        g_settingsPath = FindSettingsJsonPath();
+        g_settingsTmp = g_settingsPath + L".tmp";
+    }
+
+    // 总是销毁旧窗口后再创建: 这样每次托盘双击都会从磁盘重新读取 settings.json,
+    // 而不会显示陈旧的 in-memory json.
     HWND existing = FindWindowW(kSettingsClass, kSettingsTitle);
     if (existing) {
-        SetForegroundWindow(existing);
-        ShowWindow(existing, SW_RESTORE);
-        return;
+        DestroyWindow(existing);  // 同步触发 WM_DESTROY, 释放注入的 json
     }
 
     // 加载当前 settings.json 作为初始值
     nlohmann::json j;
     {
-        std::ifstream f(kSettingsPath);
+        std::ifstream f(g_settingsPath);
         if (f.is_open()) {
             try { f >> j; } catch (...) {}
         }
@@ -274,20 +278,17 @@ void CreateSettingsWindow() {
 
     // ── 布局计算 ──
     // 总宽: MARGIN + LABEL_W + 6 + SLIDER_W + 6 + EDIT_W + MARGIN
-    const int rowW = MARGIN + LABEL_W + 6 + SLIDER_W + 6 + EDIT_W + MARGIN;  // = 582, 用 590
+    const int rowW = MARGIN + LABEL_W + 6 + SLIDER_W + 6 + EDIT_W + MARGIN;  // = 572
     const int totalW = rowW + 8;  // 留点边框余量
 
     int y = MARGIN;
 
     int headerY = y;
     int floatStartY = headerY + HEADER_H + 6;
-    int appsY = floatStartY + ROW_H * (int)kFloatParamCount + 6;
-    int appsLabelH = ROW_H;
-    int appsEditY = appsY + appsLabelH;
-    int btnY = appsEditY + APPS_H + 12;
+    int btnY = floatStartY + ROW_H * (int)kFloatParamCount + 12;
     int statusBarY = btnY + BTN_H + 12;
 
-    const int totalH = statusBarY + STATUS_BAR_H + MARGIN;  // = 436 + 10 = ~446
+    const int totalH = statusBarY + STATUS_BAR_H + MARGIN;
 
     // 屏幕居中
     int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
@@ -341,7 +342,7 @@ void CreateSettingsWindow() {
             hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
 
         // Slider (Trackbar)
-        int scale = sliderScaleFor(kFloatParams[i].min, kFloatParams[i].max);
+        constexpr int scale = 1000;
         // 初始值: 从 j / defaults 拿
         float initVal = kFloatParams[i].min;
         if (j.contains(kFloatParams[i].key) && j[kFloatParams[i].key].is_number()) {
@@ -360,7 +361,8 @@ void CreateSettingsWindow() {
                 case 8: initVal = defaults.pollInterval; break;
             }
         }
-        initVal = std::clamp(initVal, kFloatParams[i].min, kFloatParams[i].max);
+        // 滑块位置: clamp 到 [min, sliderMax]; Edit 框保留原值供编辑
+        float sliderVal = std::clamp(initVal, kFloatParams[i].min, kFloatParams[i].sliderMax);
 
         HWND hSlider = CreateWindowExW(
             0, TRACKBAR_CLASSW, L"",
@@ -370,7 +372,7 @@ void CreateSettingsWindow() {
             GetModuleHandleW(nullptr), nullptr);
         SendMessageW(hSlider, TBM_SETRANGE, TRUE, MAKELPARAM(0, scale));
         SendMessageW(hSlider, TBM_SETPOS, TRUE,
-                     sliderValueToPos(initVal, kFloatParams[i].min, kFloatParams[i].max));
+                     sliderValueToPos(sliderVal, kFloatParams[i].min, kFloatParams[i].sliderMax));
 
         // Edit
         HWND hEdit = CreateWindowExW(
@@ -385,52 +387,31 @@ void CreateSettingsWindow() {
         SetWindowSubclass(hEdit, EditSubclassProc, 0, (DWORD_PTR)i);
     }
 
-    // ── TARGET_MUSIC_APPS 标签 ──
-    CreateWindowExW(
-        0, L"STATIC", L"TARGET_MUSIC_APPS (每行一个, 子串匹配)",
-        WS_CHILD | WS_VISIBLE | SS_LEFT,
-        MARGIN, appsY, rowW - 2 * MARGIN, appsLabelH,
-        hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+    // ── 应用 / 保存 / 取消 按钮 (从右往左依次排列) ──
+    int cancelX = rowW - MARGIN - BTN_W;
+    int saveX   = cancelX - BTN_W - 8;
+    int applyX  = saveX   - BTN_W - 8;
 
-    // ── TARGET_MUSIC_APPS (多行 Edit) ──
-    CreateWindowExW(
-        WS_EX_CLIENTEDGE, L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL,
-        MARGIN, appsEditY, rowW - 2 * MARGIN, APPS_H,
-        hwnd, (HMENU)(UINT_PTR)ID_EDIT_APPS,
-        GetModuleHandleW(nullptr), nullptr);
-    {
-        std::string joined;
-        if (auto* pj = (nlohmann::json*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-            pj && pj->contains("TARGET_MUSIC_APPS") && (*pj)["TARGET_MUSIC_APPS"].is_array()) {
-            for (const auto& v : (*pj)["TARGET_MUSIC_APPS"]) {
-                if (v.is_string()) {
-                    if (!joined.empty()) joined += "\n";
-                    joined += v.get<std::string>();
-                }
-            }
-        } else {
-            for (size_t i = 0; i < defaults.targetMusicApps.size(); ++i) {
-                if (i) joined += "\n";
-                joined += defaults.targetMusicApps[i];
-            }
-        }
-        HWND hApps = GetDlgItem(hwnd, ID_EDIT_APPS);
-        setEditTextUtf8(hApps, joined);
-    }
-
-    // ── 保存 / 取消 按钮 ──
-    CreateWindowExW(
-        0, L"BUTTON", L"保存",
-        WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-        rowW - MARGIN - 2 * BTN_W - 8, btnY, BTN_W, BTN_H,
-        hwnd, (HMENU)(UINT_PTR)ID_BTN_SAVE,
-        GetModuleHandleW(nullptr), nullptr);
+    // 取消
     CreateWindowExW(
         0, L"BUTTON", L"取消",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        rowW - MARGIN - BTN_W, btnY, BTN_W, BTN_H,
+        cancelX, btnY, BTN_W, BTN_H,
         hwnd, (HMENU)(UINT_PTR)ID_BTN_CANCEL,
+        GetModuleHandleW(nullptr), nullptr);
+    // 保存 (写盘 + 保留窗口)
+    CreateWindowExW(
+        0, L"BUTTON", L"保存",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        saveX, btnY, BTN_W, BTN_H,
+        hwnd, (HMENU)(UINT_PTR)ID_BTN_SAVE,
+        GetModuleHandleW(nullptr), nullptr);
+    // 应用 (写盘 + 保留窗口)
+    CreateWindowExW(
+        0, L"BUTTON", L"应用",
+        WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+        applyX, btnY, BTN_W, BTN_H,
+        hwnd, (HMENU)(UINT_PTR)ID_BTN_APPLY,
         GetModuleHandleW(nullptr), nullptr);
 
     // ── 底部状态栏 (SS_LEFTNOWORDWRAP, 等宽字体) ──
@@ -460,7 +441,6 @@ void CreateSettingsWindow() {
 // ───── 收集并校验所有输入 ─────
 struct ParsedValues {
     std::array<float, kFloatParamCount> floats{};
-    std::vector<std::string> apps;
 };
 
 std::optional<ParsedValues> CollectAndValidate(HWND hwnd) {
@@ -522,36 +502,14 @@ std::optional<ParsedValues> CollectAndValidate(HWND hwnd) {
         return std::nullopt;
     }
 
-    // 3) 收集 TARGET_MUSIC_APPS (按行 split, trim, lowercase, dedupe, 非空)
-    {
-        std::string raw = getEditTextUtf8(GetDlgItem(hwnd, ID_EDIT_APPS));
-        std::istringstream iss(raw);
-        std::string line;
-        while (std::getline(iss, line)) {
-            line = trimAscii(line);
-            if (line.empty()) continue;
-            line = toLowerAscii(line);
-            // 去重
-            if (std::find(pv.apps.begin(), pv.apps.end(), line) == pv.apps.end()) {
-                pv.apps.push_back(std::move(line));
-            }
-        }
-        if (pv.apps.empty()) {
-            MessageBoxW(hwnd, L"TARGET_MUSIC_APPS: 至少需要一个目标音乐应用",
-                        L"参数错误", MB_OK | MB_ICONWARNING);
-            SetFocus(GetDlgItem(hwnd, ID_EDIT_APPS));
-            return std::nullopt;
-        }
-    }
-
     return pv;
 }
 
-// ───── 原子写 settings.json (保留未知键) ─────
+// ───── 原子写 settings.json (保留未知键 + 保留 TARGET_MUSIC_APPS) ─────
 void SaveJson(const ParsedValues& pv) {
     nlohmann::json j;
     {
-        std::ifstream f(kSettingsPath);
+        std::ifstream f(g_settingsPath);
         if (f.is_open()) {
             try { f >> j; } catch (...) { j = nlohmann::json::object(); }
         }
@@ -561,8 +519,6 @@ void SaveJson(const ParsedValues& pv) {
     for (size_t i = 0; i < kFloatParamCount; ++i) {
         j[kFloatParams[i].key] = pv.floats[i];
     }
-    // 覆盖数组字段
-    j[kTargetAppsKey] = pv.apps;
 
     // 序列化: 用 4 空格缩进 + UTF-8 + trailing newline
     std::string text = j.dump(4);
@@ -570,7 +526,7 @@ void SaveJson(const ParsedValues& pv) {
 
     // 写 tmp
     {
-        std::ofstream f(kSettingsTmp, std::ios::binary | std::ios::trunc);
+        std::ofstream f(g_settingsTmp, std::ios::binary | std::ios::trunc);
         if (!f) {
             throw std::runtime_error("无法打开 settings.json.tmp 写入");
         }
@@ -583,10 +539,10 @@ void SaveJson(const ParsedValues& pv) {
     }
 
     // 原子替换
-    if (!MoveFileExW(kSettingsTmp, kSettingsPath,
+    if (!MoveFileExW(g_settingsTmp.c_str(), g_settingsPath.c_str(),
                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         // 清理 tmp
-        DeleteFileW(kSettingsTmp);
+        DeleteFileW(g_settingsTmp.c_str());
         throw std::runtime_error("MoveFileExW 替换 settings.json 失败");
     }
 }
@@ -625,8 +581,9 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             SetFocus(hEdit);
             return 0;
         }
+        // Edit 框内容 clamp 到 [min, max]; 滑块视觉位置基于 sliderMax
         float clamped = std::clamp(*v, kFloatParams[idx].min, kFloatParams[idx].max);
-        int pos = sliderValueToPos(clamped, kFloatParams[idx].min, kFloatParams[idx].max);
+        int pos = sliderValueToPos(clamped, kFloatParams[idx].min, kFloatParams[idx].sliderMax);
         SendMessageW(hSlider, TBM_SETPOS, TRUE, pos);
         setEditTextUtf8(hEdit, floatToString(clamped));
         return 0;
@@ -644,7 +601,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             ctrlId < (int)(ID_SLIDER_FLOAT_BASE + kFloatParamCount)) {
             size_t idx = (size_t)(ctrlId - ID_SLIDER_FLOAT_BASE);
             int pos = (int)SendMessageW(hSlider, TBM_GETPOS, 0, 0);
-            float val = sliderPosToValue(pos, kFloatParams[idx].min, kFloatParams[idx].max);
+            float val = sliderPosToValue(pos, kFloatParams[idx].min, kFloatParams[idx].sliderMax);
             HWND hEdit = GetDlgItem(hwnd, (int)(ID_EDIT_FLOAT_BASE + idx));
             setEditTextUtf8(hEdit, floatToString(val));
         }
@@ -678,18 +635,24 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     case WM_COMMAND: {
         WORD code = HIWORD(wParam);
         WORD id   = LOWORD(wParam);
-        if (id == ID_BTN_SAVE && code == BN_CLICKED) {
-            auto pv = CollectAndValidate(hwnd);
-            if (!pv) return 0;
+
+        auto doSave = [&](HWND h) -> bool {
+            auto pv = CollectAndValidate(h);
+            if (!pv) return false;
             try {
                 SaveJson(*pv);
             } catch (const std::exception& e) {
                 std::string msg = std::string("保存失败: ") + e.what();
-                MessageBoxW(hwnd, utf8ToWide(msg).c_str(),
+                MessageBoxW(h, utf8ToWide(msg).c_str(),
                             L"保存失败", MB_OK | MB_ICONERROR);
-                return 0;
+                return false;
             }
-            DestroyWindow(hwnd);
+            return true;
+        };
+
+        if ((id == ID_BTN_SAVE || id == ID_BTN_APPLY) && code == BN_CLICKED) {
+            // 应用 / 保存: 写盘后保留窗口 (Bug #2 修复)
+            doSave(hwnd);
             return 0;
         }
         if (id == ID_BTN_CANCEL && code == BN_CLICKED) {

@@ -22,7 +22,13 @@ std::string toLowerCopy(std::string s) {
 Config Config::load(const std::wstring& path) {
     Config c;
 
-    std::ifstream f(path);
+    // 默认参数 L"settings.json" → 走多平台路径搜索 (CWD / exe 目录)
+    std::wstring actualPath = path;
+    if (path == L"settings.json") {
+        actualPath = FindSettingsJsonPath();
+    }
+
+    std::ifstream f(actualPath);
     if (!f.is_open()) return c;  // 文件缺失 → 返回默认值
 
     nlohmann::json j;
