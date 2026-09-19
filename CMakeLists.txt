@@ -44,6 +44,9 @@ target_link_libraries(Audio_Ducking PRIVATE
   comctl32   # InitCommonControlsEx (STATIC / EDIT / BUTTON 基类)
   shell32    # Shell_NotifyIcon (托盘图标)
   gdi32      # LoadIcon / LoadCursor (托盘图标 + 光标)
+  gdiplus    # 自定义绘状态指示器 (渐变胶囊) — 新增
+  dwmapi     # 沉浸式暗色标题栏 + 圆角窗口     — 新增
+  uxtheme    # SetWindowTheme (DarkMode_Explorer) — 新增
 )
 
 # MSVC: 源文件按 UTF-8 解释 (中文字符串 + Unicode 状态符号)

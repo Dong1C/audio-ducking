@@ -1,4 +1,4 @@
-// UI.cpp — Win32 系统托盘 + 设置窗口 (模型对话框)
+// UI.cpp — Win32 系统托盘 + 设置窗口 (模型对话框) — 现代深色主题
 // 对应 Python: (无) — 全新模块
 #include "UI.h"
 #include "SettingsPanel.h"
@@ -11,6 +11,22 @@
 #include <windowsx.h>        // GET_X_LPARAM / GET_Y_LPARAM
 #include <shellapi.h>       // Shell_NotifyIcon
 #include <commctrl.h>       // InitCommonControlsEx / msctls_trackbar32 / SetWindowSubclass
+#include <objbase.h>        // GDI+ 需要 COM 基类型 (PROPID 等) — 必须在 <gdiplus.h> 之前
+#include <gdiplus.h>        // GDI+ — 自定义绘状态指示器 (渐变胶囊)
+#include <dwmapi.h>         // DWM — 沉浸式暗色标题栏 + 圆角窗口
+
+// Common Controls v6: 启用视觉样式 (圆角按钮 / 现代 Trackbar / 现代 Edit)
+#if defined(_MSC_VER)
+#pragma comment(linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
+#endif
+
+#pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "dwmapi.lib")
+
+// 旧 SDK 上 DWMWA_USE_IMMERSIVE_DARK_MODE 可能未定义
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 19
+#endif
 
 #include <nlohmann/json.hpp>
 
@@ -39,8 +55,8 @@ namespace {
 constexpr UINT WM_APP_COMMIT_PARAM = WM_APP + 1;  // 编辑框回车提交, wParam=index
 constexpr UINT WM_APP_REFRESH_UI   = WM_APP + 2;  // 刷新按钮文字与状态标签
 
-constexpr UINT ID_BTN_TOGGLE       = 1001;        // 替换原 checkbox
-constexpr UINT ID_STATUS_LABEL     = 1002;        // SS_OWNERDRAW 状态指示器
+constexpr UINT ID_BTN_TOGGLE        = 1001;       // 替换原 checkbox
+constexpr UINT ID_STATUS_LABEL      = 1002;       // SS_OWNERDRAW 状态指示器
 constexpr UINT ID_SLIDER_FLOAT_BASE = 1100;       // +0..+8 -> 9 个滑块
 constexpr UINT ID_EDIT_FLOAT_BASE   = 1010;       // +0..+8 -> 9 个编辑框
 constexpr UINT ID_BTN_SAVE          = 1020;
@@ -52,20 +68,90 @@ constexpr UINT ID_TIMER_REFRESH     = 1;          // 100ms 定时器
 constexpr UINT WM_USER_TRAY = WM_USER + 1;
 constexpr UINT ID_TRAY_ICON = 1;
 
-constexpr int SLIDER_W = 260;
-constexpr int LABEL_W = 200;
-constexpr int EDIT_W = 90;
-constexpr int ROW_H = 24;
-constexpr int MARGIN = 10;
-constexpr int HEADER_H = 32;
-constexpr int STATUS_BAR_H = 26;
-constexpr int BTN_H = 28;
-constexpr int BTN_W = 90;
+// ───── 现代 UI 布局常量 ─────
+constexpr int ROW_H         = 32;
+constexpr int MARGIN        = 16;
+constexpr int HEADER_H      = 44;
+constexpr int STATUS_BAR_H  = 30;
+constexpr int BTN_H         = 32;
+constexpr int BTN_W         = 88;
+constexpr int PILL_W        = 180;
+constexpr int PILL_H        = 36;
+constexpr int TOGGLE_BTN_W  = 130;
+constexpr int LABEL_W       = 220;
+constexpr int SLIDER_W      = 320;
+constexpr int EDIT_W        = 110;
+
+// 目标窗口尺寸
+constexpr int WINDOW_W      = 740;
+constexpr int WINDOW_H      = 580;
+
+// 配色
+constexpr COLORREF CLR_BG_DARK   = RGB(30, 30, 30);     // #1E1E1E
+constexpr COLORREF CLR_TEXT_HI   = RGB(220, 220, 220);
+constexpr COLORREF CLR_STATUS_OK = RGB(160, 230, 160);
 
 constexpr LPCWSTR kMainWndClass   = L"AudioDuckingMainWnd";
 constexpr LPCWSTR kSettingsClass  = L"AudioDuckingSettingsWnd";
 constexpr LPCWSTR kSettingsTitle  = L"Audio Ducking — 设置";
 constexpr LPCWSTR kMainWndTitle   = L"AudioDucking";
+
+// ───── 现代资源 (字体 / GDI+ token / 暗画刷) ─────
+HFONT       g_hFont       = nullptr;  // Segoe UI 9pt
+HFONT       g_hFontBold   = nullptr;  // Segoe UI Semibold 9pt
+HFONT       g_hFontSmall  = nullptr;  // Segoe UI 8pt
+HFONT       g_hFontMono   = nullptr;  // Consolas 9pt (状态栏)
+ULONG_PTR   g_gdiplusToken = 0;
+HBRUSH      g_hDarkBrush  = nullptr;  // WM_CTLCOLORSTATIC 用
+
+void InitModernResources() {
+    // GDI+ (用于自定义绘状态指示器)
+    if (!g_gdiplusToken) {
+        Gdiplus::GdiplusStartupInput si;
+        Gdiplus::GdiplusStartup(&g_gdiplusToken, &si, nullptr);
+    }
+
+    // Segoe UI — Common Controls v6 视觉样式下文字更易读
+    g_hFont = CreateFontW(
+        -16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+    g_hFontBold = CreateFontW(
+        -16, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_SWISS, L"Segoe UI Semibold");
+    g_hFontSmall = CreateFontW(
+        -14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+    g_hFontMono = CreateFontW(
+        -15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        FIXED_PITCH | FF_MODERN, L"Consolas");
+
+    // 暗背景画刷 (WM_CTLCOLORSTATIC 用)
+    g_hDarkBrush = CreateSolidBrush(CLR_BG_DARK);
+}
+
+void CleanupModernResources() {
+    if (g_hFont)      { DeleteObject(g_hFont);      g_hFont = nullptr; }
+    if (g_hFontBold)  { DeleteObject(g_hFontBold);  g_hFontBold = nullptr; }
+    if (g_hFontSmall) { DeleteObject(g_hFontSmall); g_hFontSmall = nullptr; }
+    if (g_hFontMono)  { DeleteObject(g_hFontMono);  g_hFontMono = nullptr; }
+    if (g_hDarkBrush) { DeleteObject(g_hDarkBrush); g_hDarkBrush = nullptr; }
+    if (g_gdiplusToken) {
+        Gdiplus::GdiplusShutdown(g_gdiplusToken);
+        g_gdiplusToken = 0;
+    }
+}
+
+void ApplyModernFontToControl(HWND h) {
+    if (h && g_hFont) SendMessageW(h, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+}
+
+void ApplyModernThemeToControl(HWND h) {
+    if (h) SetWindowTheme(h, L"DarkMode_Explorer", nullptr);
+}
 
 // settings.json 路径 (单点真相, 由 FindSettingsJsonPath() 在窗口创建时解析)
 std::wstring g_settingsPath;                  // 主入口 (默认空 → 用 FindSettingsJsonPath())
@@ -276,72 +362,72 @@ void CreateSettingsWindow() {
     }
     Config defaults;  // 提供默认 fallback
 
-    // ── 布局计算 ──
-    // 总宽: MARGIN + LABEL_W + 6 + SLIDER_W + 6 + EDIT_W + MARGIN
-    const int rowW = MARGIN + LABEL_W + 6 + SLIDER_W + 6 + EDIT_W + MARGIN;  // = 572
-    const int totalW = rowW + 8;  // 留点边框余量
-
-    int y = MARGIN;
-
-    int headerY = y;
-    int floatStartY = headerY + HEADER_H + 6;
-    int btnY = floatStartY + ROW_H * (int)kFloatParamCount + 12;
-    int statusBarY = btnY + BTN_H + 12;
-
-    const int totalH = statusBarY + STATUS_BAR_H + MARGIN;
-
-    // 屏幕居中
+    // ── 屏幕居中 ──
     int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
-    int x = (sw - totalW) / 2, yy = (sh - totalH) / 2;
+    int x = (sw - WINDOW_W) / 2, yy = (sh - WINDOW_H) / 2;
 
     HWND hwnd = CreateWindowExW(
         WS_EX_DLGMODALFRAME,
         kSettingsClass, kSettingsTitle,
         WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        x, yy, totalW, totalH,
+        x, yy, WINDOW_W, WINDOW_H,
         nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!hwnd) return;
+
+    // ── DWM: 沉浸式暗标题栏 + 圆角 ──
+    BOOL dark = TRUE;
+    DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+    DWM_WINDOW_CORNER_PREFERENCE corner = DWMWCP_ROUND;
+    DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof(corner));
 
     // 注入初始值 + 编辑控件 ID
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)new nlohmann::json(std::move(j)));
 
     // ── Header 行 ──
-    // 左: 状态指示器 (SS_OWNERDRAW)
+    // 左: 状态指示器 (SS_OWNERDRAW, GDI+ 自绘渐变胶囊)
     {
+        int pillX = MARGIN;
+        int pillY = MARGIN + (HEADER_H - PILL_H) / 2;
         HWND hStatus = CreateWindowExW(
             0, L"STATIC", L"",
             WS_CHILD | WS_VISIBLE | SS_OWNERDRAW | SS_NOTIFY,
-            MARGIN, headerY + 4, 100, HEADER_H - 4,
+            pillX, pillY, PILL_W, PILL_H,
             hwnd, (HMENU)(UINT_PTR)ID_STATUS_LABEL,
             GetModuleHandleW(nullptr), nullptr);
         (void)hStatus;
     }
-    // 右: 启用/暂停按钮
+    // 右: 启用/暂停按钮 (TOGGLE_BTN_W × BTN_H, 视觉样式 = 现代扁平)
     {
-        int btnW = 130;
-        CreateWindowExW(
+        int toggleX = WINDOW_W - MARGIN - TOGGLE_BTN_W;
+        int toggleY = MARGIN + (HEADER_H - BTN_H) / 2;
+        HWND hBtn = CreateWindowExW(
             0, L"BUTTON", L"启用 Ducking",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            rowW - MARGIN - btnW, headerY + 2, btnW, HEADER_H - 4,
+            toggleX, toggleY, TOGGLE_BTN_W, BTN_H,
             hwnd, (HMENU)(UINT_PTR)ID_BTN_TOGGLE,
             GetModuleHandleW(nullptr), nullptr);
+        ApplyModernFontToControl(hBtn);
+        ApplyModernThemeToControl(hBtn);
     }
 
     // ── 9 个浮点参数 (滑块 + 编辑框) ──
+    int floatStartY = MARGIN + HEADER_H + 14;
     int sliderX = MARGIN + LABEL_W + 6;
-    int editX = sliderX + SLIDER_W + 6;
+    int editX   = sliderX + SLIDER_W + 6;
 
     for (size_t i = 0; i < kFloatParamCount; ++i) {
         int rowY = floatStartY + (int)i * ROW_H;
         // Label
         std::wstring lblW = utf8ToWide(kFloatParams[i].label);
-        CreateWindowExW(
+        HWND hLabel = CreateWindowExW(
             0, L"STATIC", lblW.c_str(),
-            WS_CHILD | WS_VISIBLE | SS_LEFT,
-            MARGIN, rowY + 4, LABEL_W, ROW_H - 4,
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_LEFTNOWORDWRAP,
+            MARGIN, rowY + 6, LABEL_W, ROW_H - 6,
             hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+        ApplyModernFontToControl(hLabel);
+        ApplyModernThemeToControl(hLabel);
 
-        // Slider (Trackbar)
+        // Slider (Trackbar) — Common Controls v6 视觉样式 + DarkMode_Explorer
         constexpr int scale = 1000;
         // 初始值: 从 j / defaults 拿
         float initVal = kFloatParams[i].min;
@@ -367,72 +453,60 @@ void CreateSettingsWindow() {
         HWND hSlider = CreateWindowExW(
             0, TRACKBAR_CLASSW, L"",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_HORZ | TBS_AUTOTICKS,
-            sliderX, rowY + 2, SLIDER_W, ROW_H - 2,
+            sliderX, rowY + 4, SLIDER_W, ROW_H - 4,
             hwnd, (HMENU)(UINT_PTR)(ID_SLIDER_FLOAT_BASE + i),
             GetModuleHandleW(nullptr), nullptr);
         SendMessageW(hSlider, TBM_SETRANGE, TRUE, MAKELPARAM(0, scale));
         SendMessageW(hSlider, TBM_SETPOS, TRUE,
                      sliderValueToPos(sliderVal, kFloatParams[i].min, kFloatParams[i].sliderMax));
+        ApplyModernThemeToControl(hSlider);
 
-        // Edit
+        // Edit (v6 视觉样式 + Segoe UI)
         HWND hEdit = CreateWindowExW(
             WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | ES_LEFT | ES_AUTOHSCROLL,
-            editX, rowY + 2, EDIT_W, ROW_H - 2,
+            editX, rowY + 2, EDIT_W, ROW_H - 4,
             hwnd, (HMENU)(UINT_PTR)(ID_EDIT_FLOAT_BASE + i),
             GetModuleHandleW(nullptr), nullptr);
         setEditTextUtf8(hEdit, floatToString(initVal));
+        ApplyModernFontToControl(hEdit);
+        ApplyModernThemeToControl(hEdit);
 
         // 拦截回车
         SetWindowSubclass(hEdit, EditSubclassProc, 0, (DWORD_PTR)i);
     }
 
-    // ── 应用 / 保存 / 取消 按钮 (从右往左依次排列) ──
-    int cancelX = rowW - MARGIN - BTN_W;
-    int saveX   = cancelX - BTN_W - 8;
-    int applyX  = saveX   - BTN_W - 8;
+    // ── 应用 / 保存 / 取消 按钮 (从右往左依次排列, 视觉样式扁平) ──
+    int btnY     = floatStartY + ROW_H * (int)kFloatParamCount + 24;
+    int cancelX  = WINDOW_W - MARGIN - BTN_W;
+    int saveX    = cancelX - BTN_W - 8;
+    int applyX   = saveX   - BTN_W - 8;
 
-    // 取消
-    CreateWindowExW(
-        0, L"BUTTON", L"取消",
-        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        cancelX, btnY, BTN_W, BTN_H,
-        hwnd, (HMENU)(UINT_PTR)ID_BTN_CANCEL,
-        GetModuleHandleW(nullptr), nullptr);
-    // 保存 (写盘 + 保留窗口)
-    CreateWindowExW(
-        0, L"BUTTON", L"保存",
-        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        saveX, btnY, BTN_W, BTN_H,
-        hwnd, (HMENU)(UINT_PTR)ID_BTN_SAVE,
-        GetModuleHandleW(nullptr), nullptr);
-    // 应用 (写盘 + 保留窗口)
-    CreateWindowExW(
-        0, L"BUTTON", L"应用",
-        WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-        applyX, btnY, BTN_W, BTN_H,
-        hwnd, (HMENU)(UINT_PTR)ID_BTN_APPLY,
-        GetModuleHandleW(nullptr), nullptr);
+    auto makeButton = [&](int id, LPCWSTR text, DWORD style, int bx) -> HWND {
+        HWND h = CreateWindowExW(
+            0, L"BUTTON", text,
+            WS_CHILD | WS_VISIBLE | style,
+            bx, btnY, BTN_W, BTN_H,
+            hwnd, (HMENU)(UINT_PTR)id,
+            GetModuleHandleW(nullptr), nullptr);
+        ApplyModernFontToControl(h);
+        ApplyModernThemeToControl(h);
+        return h;
+    };
+    makeButton(ID_BTN_CANCEL, L"取消", BS_PUSHBUTTON,    cancelX);
+    makeButton(ID_BTN_SAVE,   L"保存", BS_PUSHBUTTON,    saveX);
+    makeButton(ID_BTN_APPLY,  L"应用", BS_DEFPUSHBUTTON, applyX);
 
-    // ── 底部状态栏 (SS_LEFTNOWORDWRAP, 等宽字体) ──
+    // ── 底部状态栏 (SS_LEFTNOWORDWRAP, Consolas 9pt, 暗主题) ──
+    int statusBarY = btnY + BTN_H + 22;
     HWND hStatusBar = CreateWindowExW(
         WS_EX_STATICEDGE, L"STATIC", L"",
         WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP | SS_NOPREFIX,
-        MARGIN, statusBarY, rowW - 2 * MARGIN, STATUS_BAR_H - 6,
+        MARGIN, statusBarY, WINDOW_W - 2 * MARGIN, STATUS_BAR_H - 6,
         hwnd, (HMENU)(UINT_PTR)ID_STATUS_BAR,
         GetModuleHandleW(nullptr), nullptr);
-
-    // 等宽字体 (Consolas, 失败回退 system fixed)
-    HFONT hMono = CreateFontW(
-        -14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY, FF_MODERN | FIXED_PITCH, L"Consolas");
-    if (!hMono) {
-        hMono = (HFONT)GetStockObject(SYSTEM_FIXED_FONT);
-    }
-    if (hMono) {
-        SendMessageW(hStatusBar, WM_SETFONT, (WPARAM)hMono, TRUE);
-    }
+    if (g_hFontMono) SendMessageW(hStatusBar, WM_SETFONT, (WPARAM)g_hFontMono, TRUE);
+    ApplyModernThemeToControl(hStatusBar);
 
     // 初始化按钮文字 (避免 WM_TIMER 兜底前的瞬间空白)
     RefreshEnableVisuals(hwnd);
@@ -611,25 +685,60 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     case WM_DRAWITEM: {
         auto* dis = (DRAWITEMSTRUCT*)lParam;
         if (dis->CtlID == ID_STATUS_LABEL) {
+            // GDI+ 自绘: 圆角胶囊 + 垂直渐变 + 中心文字
+            using namespace Gdiplus;
+            Graphics g(dis->hDC);
+            g.SetSmoothingMode(SmoothingModeAntiAlias);
+            g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
+
             bool active = UI::enabled.load();
-            COLORREF bg = active ? RGB(0, 150, 0) : RGB(180, 180, 180);
-            HBRUSH br = CreateSolidBrush(bg);
-            FillRect(dis->hDC, &dis->rcItem, br);
-            DeleteObject(br);
-            SetTextColor(dis->hDC, active ? RGB(255, 255, 255) : RGB(40, 40, 40));
-            SetBkMode(dis->hDC, TRANSPARENT);
-            const wchar_t* txt = active ? L" ● 激活中 " : L" ○ 已暂停 ";
-            RECT rc = dis->rcItem;
-            DrawTextW(dis->hDC, txt, -1, &rc,
-                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            RectF rect((REAL)dis->rcItem.left, (REAL)dis->rcItem.top,
+                       (REAL)(dis->rcItem.right - dis->rcItem.left),
+                       (REAL)(dis->rcItem.bottom - dis->rcItem.top));
+
+            // 垂直渐变 (激活: 亮绿 → 深绿; 暂停: 浅灰 → 深灰)
+            Color c1 = active ? Color(255, 0, 200, 83)   : Color(255, 92, 92, 92);
+            Color c2 = active ? Color(255, 0, 160, 64)   : Color(255, 58, 58, 58);
+            LinearGradientBrush brush(rect, c1, c2, LinearGradientModeVertical);
+
+            // 圆角胶囊路径 (左半圆 + 右半圆)
+            float radius = rect.Height / 2.0f;
+            GraphicsPath path;
+            path.AddArc(rect.X, rect.Y, radius * 2, rect.Height, 90, 180);
+            path.AddArc(rect.X + rect.Width - radius * 2, rect.Y, radius * 2, rect.Height, 270, 180);
+            path.CloseFigure();
+            g.FillPath(&brush, &path);
+
+            // 细边框 (白色 80% / 灰色 70%)
+            Pen borderPen(active ? Color(255, 255, 255, 255) : Color(180, 200, 200, 200), 1.0f);
+            g.DrawPath(&borderPen, &path);
+
+            // Segoe UI Semibold 11pt 文字 (激活: 亮白; 暂停: 浅灰)
+            FontFamily fontFamily(L"Segoe UI");
+            Font font(&fontFamily, 11.0f, FontStyleBold);
+            SolidBrush textBrush(active ? Color(255, 250, 250, 250) : Color(255, 220, 220, 220));
+            StringFormat format;
+            format.SetAlignment(StringAlignmentCenter);
+            format.SetLineAlignment(StringAlignmentCenter);
+            format.SetFormatFlags(StringFormatFlagsNoWrap);
+            const wchar_t* txt = active ? L"●  正在 Ducking" : L"○  已暂停";
+            g.DrawString(txt, -1, &font, rect, &format, &textBrush);
             return TRUE;
         }
         return 0;
     }
 
     case WM_CTLCOLORSTATIC: {
-        // 状态栏 (ID_STATUS_BAR) 与普通 label 不需要特殊着色; 让默认处理即可
-        return DefWindowProcW(hwnd, msg, wParam, lParam);
+        // 暗主题: 浅文字 + 暗背景
+        HDC hdc = (HDC)wParam;
+        int id = GetDlgCtrlID((HWND)lParam);
+        if (id == ID_STATUS_BAR) {
+            SetTextColor(hdc, CLR_STATUS_OK);  // 状态栏文本: 浅绿
+        } else {
+            SetTextColor(hdc, CLR_TEXT_HI);    // 普通 label: 浅灰
+        }
+        SetBkMode(hdc, TRANSPARENT);
+        return (LRESULT)g_hDarkBrush;
     }
 
     case WM_COMMAND: {
@@ -702,7 +811,8 @@ bool RegisterWindowClasses() {
     wcs.lpfnWndProc   = SettingsWndProc;
     wcs.hInstance     = GetModuleHandleW(nullptr);
     wcs.lpszClassName = kSettingsClass;
-    wcs.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    // 暗色背景画刷 (#1E1E1E) — 与窗口级 DWM 暗标题栏协调
+    wcs.hbrBackground = CreateSolidBrush(CLR_BG_DARK);
     wcs.hIcon         = LoadIconW(nullptr, (LPCWSTR)IDI_APPLICATION);
     wcs.hCursor       = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
     if (!RegisterClassExW(&wcs)) return false;
@@ -750,7 +860,13 @@ std::wstring UI::getLiveStatus() {
 
 // ───── 线程入口 ─────
 int UI::runMessageLoop() {
-    if (!RegisterWindowClasses()) return 1;
+    // 现代资源 (字体 / GDI+ / 暗画刷) — 必须在任何窗口创建前就绪
+    InitModernResources();
+
+    if (!RegisterWindowClasses()) {
+        CleanupModernResources();
+        return 1;
+    }
 
     // 建一个隐藏主窗口 (用来接收托盘消息 + 干净退出)
     g_mainHwnd = CreateWindowExW(
@@ -758,10 +874,14 @@ int UI::runMessageLoop() {
         0,  // hidden: no style
         0, 0, 0, 0,
         nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
-    if (!g_mainHwnd) return 1;
+    if (!g_mainHwnd) {
+        CleanupModernResources();
+        return 1;
+    }
 
     if (!AddTrayIcon(g_mainHwnd)) {
         DestroyWindow(g_mainHwnd);
+        CleanupModernResources();
         return 1;
     }
 
@@ -774,6 +894,7 @@ int UI::runMessageLoop() {
 
     RemoveTrayIcon(g_mainHwnd);
     DestroyWindow(g_mainHwnd);
+    CleanupModernResources();
     return 0;
 }
 
