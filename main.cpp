@@ -3,6 +3,7 @@
 #include "Config.h"
 #include "StateMachine.h"
 #include "VolumeWriter.h"
+#include "UI.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -11,6 +12,7 @@
 #include <cstdio>
 #include <iomanip>
 #include <iostream>
+#include <thread>
 
 using namespace duck;
 
@@ -22,6 +24,7 @@ int wmain() {
     std::cout << "============================================================\n";
     std::cout << " Audio Ducking (C++) — 动态比例闪避 启动\n";
     std::cout << " 运行时可调参数: 编辑 settings.json (热加载, 无需重启)\n";
+    std::cout << " 系统托盘: 双击打开设置 / 右键切换启用或退出\n";
     std::cout << "============================================================\n";
 
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
@@ -29,6 +32,9 @@ int wmain() {
         std::cerr << "CoInitializeEx failed (hr=0x" << std::hex << hr << ")\n";
         return 1;
     }
+
+    // UI 线程 (独立 Win32 消息循环; 不持有 COM apartment)
+    std::thread uiThread([]() { UI::runMessageLoop(); });
 
     AudioScanner scanner;
     DuckerStateMachine sm;
@@ -41,7 +47,13 @@ int wmain() {
             std::chrono::steady_clock::now() - t0).count();
     };
 
-    while (true) {
+    while (!UI::shouldExit.load()) {
+        // ── 0. 暂停短路 (托盘 "禁用" 时空转, 不消耗 CPU) ──
+        if (!UI::enabled.load()) {
+            Sleep(50);
+            continue;
+        }
+
         // ── 1. 加载配置 (热加载) ──────────────────────
         Config cfg = Config::load();
         Sleep(static_cast<DWORD>(cfg.pollInterval * 1000.0f));
@@ -71,7 +83,9 @@ int wmain() {
         std::fflush(stdout);
     }
 
-    // 实际不会执行到这里
+    // 等待 UI 线程干净退出 (PostQuitMessage 已发出)
+    uiThread.join();
+
     CoUninitialize();
     return 0;
 }

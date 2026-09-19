@@ -29,6 +29,7 @@ add_executable(Audio_Ducking
   Config.cpp
   StateMachine.cpp
   VolumeWriter.cpp
+  UI.cpp
 )
 
 target_include_directories(Audio_Ducking PRIVATE
@@ -39,6 +40,10 @@ target_link_libraries(Audio_Ducking PRIVATE
   nlohmann_json::nlohmann_json
   Ole32      # CoInitializeEx / CoCreateInstance / CoUninitialize
   Mmdevapi   # WASAPI (IMMDeviceEnumerator / IAudioSessionManager2 / ...)
+  user32     # CreateWindowEx / WndProc / GetMessage / DispatchMessage
+  comctl32   # InitCommonControlsEx (STATIC / EDIT / BUTTON 基类)
+  shell32    # Shell_NotifyIcon (托盘图标)
+  gdi32      # LoadIcon / LoadCursor (托盘图标 + 光标)
 )
 
 # MSVC: 源文件按 UTF-8 解释 (中文字符串 + Unicode 状态符号)
