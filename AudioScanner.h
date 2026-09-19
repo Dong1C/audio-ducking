@@ -11,6 +11,7 @@
 #include <wrl/client.h>
 
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -23,6 +24,7 @@ struct AudioSession {
     std::string processName;  // 小写
     ComPtr<ISimpleAudioVolume> volume;
     ComPtr<IAudioMeterInformation> meter;
+    float originalVolume = 1.0f;   // 首次扫描时的音量
 };
 
 class AudioScanner {
@@ -37,8 +39,15 @@ public:
     std::pair<std::vector<AudioSession>, float> scan(
         const std::vector<std::string>& targetMusicApps);
 
+    // 把传入 sessions 中所有已记录原始音量的还原回去, 还原后清空缓存
+    size_t restoreOriginalVolumes(const std::vector<AudioSession>& sessions);
+
+    // 手动清空原始音量缓存 (不调用 restore)
+    void clearVolumeCache();
+
 private:
     ComPtr<IMMDeviceEnumerator> enumerator_;
+    std::unordered_map<DWORD, float> originalVolumes_;  // pid → 首次音量
 };
 
 } // namespace duck

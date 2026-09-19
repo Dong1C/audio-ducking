@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <iomanip>
 #include <iostream>
+#include <string>
 #include <thread>
 
 using namespace duck;
@@ -47,12 +48,26 @@ int wmain() {
             std::chrono::steady_clock::now() - t0).count();
     };
 
+    bool wasEnabled = true;
+
     while (!UI::shouldExit.load()) {
-        // ── 0. 暂停短路 (托盘 "禁用" 时空转, 不消耗 CPU) ──
+        // ── 0. 暂停短路 ──
         if (!UI::enabled.load()) {
+            if (wasEnabled) {
+                // 仅在 enabled→disabled 边界做一次恢复
+                Config cfg = Config::load();
+                auto [sessions, _] = scanner.scan(cfg.targetMusicApps);
+                if (!sessions.empty()) {
+                    size_t n = scanner.restoreOriginalVolumes(sessions);
+                    std::printf("\n[已暂停] 恢复 %zu 个 session 的原始音量\n", n);
+                    std::fflush(stdout);
+                }
+                wasEnabled = false;
+            }
             Sleep(50);
             continue;
         }
+        wasEnabled = true;
 
         // ── 1. 加载配置 (热加载) ──────────────────────
         Config cfg = Config::load();
@@ -73,14 +88,32 @@ int wmain() {
         // ── 4. 写入音量 ─────────────────────────────────
         VolumeWriter::write(sessions, currentVol, cfg.maxVol, cfg.minTargetVol);
 
-        // ── 5. 单行状态打印 (与 Python 版同格式) ───────
-        std::printf(
+        // ── 5. 单行状态打印 + 同步到 UI 状态栏 ─────────
+        char buf[256];
+        int n = std::snprintf(buf, sizeof(buf),
             "\r[%-12s] Peak: %5.2f | Th: %.3f | MaxP: %.2f "
             "| Floor: %4.1f%% | Target: %5.1f%% | Vol: %5.1f%% | a: %.2f",
             r.status.c_str(), peak, cfg.triggerThreshold, cfg.maxPeak,
             cfg.minTargetVol * 100.0f, r.target * 100.0f, currentVol * 100.0f,
             r.alpha);
+        std::fwrite(buf, 1, n, stdout);
         std::fflush(stdout);
+
+        // 跳过 \r; 转为 UTF-16 给 UI 线程
+        std::string lineUtf8(buf + 1);
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, lineUtf8.data(), (int)lineUtf8.size(),
+                                        nullptr, 0);
+        std::wstring wline((size_t)wlen, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, lineUtf8.data(), (int)lineUtf8.size(),
+                            wline.data(), wlen);
+        UI::setLiveStatus(wline);
+    }
+
+    // 退出前若仍处于 enabled, 最后一次恢复
+    if (wasEnabled) {
+        Config cfg = Config::load();
+        auto [sessions, _] = scanner.scan(cfg.targetMusicApps);
+        if (!sessions.empty()) scanner.restoreOriginalVolumes(sessions);
     }
 
     // 等待 UI 线程干净退出 (PostQuitMessage 已发出)

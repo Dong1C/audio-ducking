@@ -8,14 +8,16 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <windowsx.h>        // GET_X_LPARAM / GET_Y_LPARAM
 #include <shellapi.h>       // Shell_NotifyIcon
-#include <commctrl.h>       // InitCommonControlsEx
+#include <commctrl.h>       // InitCommonControlsEx / msctls_trackbar32 / SetWindowSubclass
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <optional>
@@ -33,14 +35,33 @@ std::atomic<bool> UI::shouldExit{false};
 // ───── 控件 ID 约定 (与 SettingsPanel.h 顺序对应) ─────
 namespace {
 
-constexpr UINT ID_CHECK_ENABLED   = 1001;
-constexpr UINT ID_EDIT_FLOAT_BASE = 1010;   // +0..+8 → 9 个浮点 Edit
-constexpr UINT ID_EDIT_APPS       = 1019;   // TARGET_MUSIC_APPS
-constexpr UINT ID_BTN_SAVE        = 1020;
-constexpr UINT ID_BTN_CANCEL      = 1021;
+// 自定义消息
+constexpr UINT WM_APP_COMMIT_PARAM = WM_APP + 1;  // 编辑框回车提交, wParam=index
+constexpr UINT WM_APP_REFRESH_UI   = WM_APP + 2;  // 刷新按钮文字与状态标签
+
+constexpr UINT ID_BTN_TOGGLE       = 1001;        // 替换原 checkbox
+constexpr UINT ID_STATUS_LABEL     = 1002;        // SS_OWNERDRAW 状态指示器
+constexpr UINT ID_SLIDER_FLOAT_BASE = 1100;       // +0..+8 -> 9 个滑块
+constexpr UINT ID_EDIT_FLOAT_BASE   = 1010;       // +0..+8 -> 9 个编辑框
+constexpr UINT ID_EDIT_APPS         = 1019;       // TARGET_MUSIC_APPS
+constexpr UINT ID_BTN_SAVE          = 1020;
+constexpr UINT ID_BTN_CANCEL        = 1021;
+constexpr UINT ID_STATUS_BAR        = 1022;       // 底部状态栏 (SS_LEFTNOWORDWRAP)
+constexpr UINT ID_TIMER_REFRESH     = 1;          // 100ms 定时器
 
 constexpr UINT WM_USER_TRAY = WM_USER + 1;
 constexpr UINT ID_TRAY_ICON = 1;
+
+constexpr int SLIDER_W = 260;
+constexpr int LABEL_W = 200;
+constexpr int EDIT_W = 90;
+constexpr int ROW_H = 24;
+constexpr int MARGIN = 10;
+constexpr int HEADER_H = 32;
+constexpr int APPS_H = 70;       // 多行 Edit 高度
+constexpr int STATUS_BAR_H = 26;
+constexpr int BTN_H = 28;
+constexpr int BTN_W = 90;
 
 constexpr LPCWSTR kMainWndClass   = L"AudioDuckingMainWnd";
 constexpr LPCWSTR kSettingsClass  = L"AudioDuckingSettingsWnd";
@@ -85,6 +106,26 @@ std::string trimAscii(std::string s) {
     s.erase(s.begin(), std::find_if(s.begin(), s.end(), notSpace));
     s.erase(std::find_if(s.rbegin(), s.rend(), notSpace).base(), s.end());
     return s;
+}
+
+// ───── 滑块 <-> 数值 转换 ─────
+inline int sliderScaleFor(float min, float max) {
+    float range = max - min;
+    if (range <= 1.0f)  return 1000;     // 0.001 步进
+    if (range <= 10.0f) return 10000;    // 0.001 步进
+    return 36000;                       // 0.1 步进
+}
+
+inline int sliderValueToPos(float v, float min, float max) {
+    int scale = sliderScaleFor(min, max);
+    float norm = (v - min) / (max - min);
+    return (int)std::lround(norm * scale);
+}
+
+inline float sliderPosToValue(int pos, float min, float max) {
+    int scale = sliderScaleFor(min, max);
+    float norm = (float)pos / (float)scale;
+    return min + norm * (max - min);
 }
 
 // ───── 工具: 编辑框读文本 (UTF-8) ─────
@@ -132,8 +173,27 @@ void fillEditFromConfigOrJson(HWND hEdit, const char* key,
     }
 }
 
+// ───── 子过程: 拦截编辑框回车, 通知父窗口提交 ─────
+LRESULT CALLBACK EditSubclassProc(HWND h, UINT m, WPARAM w, LPARAM l,
+                                  UINT_PTR /*id*/, DWORD_PTR ref) {
+    if (m == WM_KEYDOWN && w == VK_RETURN) {
+        SendMessageW(GetParent(h), WM_APP_COMMIT_PARAM, (WPARAM)ref, 0);
+        return 0;
+    }
+    return DefSubclassProc(h, m, w, l);
+}
+
 // ───── 主窗口实例 (UI 线程句柄; 用于 WM_USER_TRAY) ─────
 HWND g_mainHwnd = nullptr;
+
+// ───── 立即刷新"启用/暂停"按钮文字 + 状态标签 ─────
+void RefreshEnableVisuals(HWND hwnd) {
+    bool en = UI::enabled.load();
+    SetWindowTextW(GetDlgItem(hwnd, ID_BTN_TOGGLE),
+                   en ? L"暂停 Ducking" : L"启用 Ducking");
+    HWND hStatus = GetDlgItem(hwnd, ID_STATUS_LABEL);
+    if (hStatus) InvalidateRect(hStatus, nullptr, FALSE);   // 触发重绘
+}
 
 // ───── 设置窗口创建 (前向声明: MainWndProc 中会调用) ─────
 void CreateSettingsWindow();
@@ -171,6 +231,8 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 
             if (cmd == 1001) {
                 UI::enabled.store(!UI::enabled.load());
+                HWND sw = FindWindowW(kSettingsClass, kSettingsTitle);
+                if (sw) PostMessageW(sw, WM_APP_REFRESH_UI, 0, 0);
             } else if (cmd == 1002) {
                 CreateSettingsWindow();
             } else if (cmd == 1003) {
@@ -210,56 +272,131 @@ void CreateSettingsWindow() {
     }
     Config defaults;  // 提供默认 fallback
 
-    // 计算尺寸 (一行 = 24 px, 9 float + 1 apps (高 60) + 1 checkbox + 2 buttons)
-    const int rowH     = 24;
-    const int margin   = 10;
-    const int checkH   = 24;
-    const int appsRows = 4;
-    const int appsH    = rowH * appsRows;
-    const int btnH     = 28;
-    const int labelW   = 280;
-    const int editW    = 200;
-    const int editX    = margin + labelW + 6;
-    const int rowW     = editX + editW + margin;
+    // ── 布局计算 ──
+    // 总宽: MARGIN + LABEL_W + 6 + SLIDER_W + 6 + EDIT_W + MARGIN
+    const int rowW = MARGIN + LABEL_W + 6 + SLIDER_W + 6 + EDIT_W + MARGIN;  // = 582, 用 590
+    const int totalW = rowW + 8;  // 留点边框余量
 
-    int y = margin;
-    int appsY = margin + checkH + 6;
-    int floatStartY = appsY + appsH + 12;
-    int btnY = floatStartY + rowH * (int)kFloatParamCount + 16;
+    int y = MARGIN;
 
-    int totalH = btnY + btnH + margin;
+    int headerY = y;
+    int floatStartY = headerY + HEADER_H + 6;
+    int appsY = floatStartY + ROW_H * (int)kFloatParamCount + 6;
+    int appsLabelH = ROW_H;
+    int appsEditY = appsY + appsLabelH;
+    int btnY = appsEditY + APPS_H + 12;
+    int statusBarY = btnY + BTN_H + 12;
+
+    const int totalH = statusBarY + STATUS_BAR_H + MARGIN;  // = 436 + 10 = ~446
 
     // 屏幕居中
     int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
-    int x = (sw - rowW) / 2, yy = (sh - totalH) / 2;
+    int x = (sw - totalW) / 2, yy = (sh - totalH) / 2;
 
     HWND hwnd = CreateWindowExW(
         WS_EX_DLGMODALFRAME,
         kSettingsClass, kSettingsTitle,
         WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        x, yy, rowW, totalH,
+        x, yy, totalW, totalH,
         nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!hwnd) return;
 
     // 注入初始值 + 编辑控件 ID
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)new nlohmann::json(std::move(j)));
 
-    // ── checkbox ──
-    HWND hCheck = CreateWindowExW(
-        0, L"BUTTON", L"启用闪避 (取消勾选 = 暂停)",
-        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-        margin, y, rowW - 2 * margin, checkH,
-        hwnd, (HMENU)(UINT_PTR)ID_CHECK_ENABLED,
-        GetModuleHandleW(nullptr), nullptr);
-    SendMessageW(hCheck, BM_SETCHECK,
-                 UI::enabled.load() ? BST_CHECKED : BST_UNCHECKED, 0);
-    y += checkH + 4;
+    // ── Header 行 ──
+    // 左: 状态指示器 (SS_OWNERDRAW)
+    {
+        HWND hStatus = CreateWindowExW(
+            0, L"STATIC", L"",
+            WS_CHILD | WS_VISIBLE | SS_OWNERDRAW | SS_NOTIFY,
+            MARGIN, headerY + 4, 100, HEADER_H - 4,
+            hwnd, (HMENU)(UINT_PTR)ID_STATUS_LABEL,
+            GetModuleHandleW(nullptr), nullptr);
+        (void)hStatus;
+    }
+    // 右: 启用/暂停按钮
+    {
+        int btnW = 130;
+        CreateWindowExW(
+            0, L"BUTTON", L"启用 Ducking",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            rowW - MARGIN - btnW, headerY + 2, btnW, HEADER_H - 4,
+            hwnd, (HMENU)(UINT_PTR)ID_BTN_TOGGLE,
+            GetModuleHandleW(nullptr), nullptr);
+    }
+
+    // ── 9 个浮点参数 (滑块 + 编辑框) ──
+    int sliderX = MARGIN + LABEL_W + 6;
+    int editX = sliderX + SLIDER_W + 6;
+
+    for (size_t i = 0; i < kFloatParamCount; ++i) {
+        int rowY = floatStartY + (int)i * ROW_H;
+        // Label
+        std::wstring lblW = utf8ToWide(kFloatParams[i].label);
+        CreateWindowExW(
+            0, L"STATIC", lblW.c_str(),
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            MARGIN, rowY + 4, LABEL_W, ROW_H - 4,
+            hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+
+        // Slider (Trackbar)
+        int scale = sliderScaleFor(kFloatParams[i].min, kFloatParams[i].max);
+        // 初始值: 从 j / defaults 拿
+        float initVal = kFloatParams[i].min;
+        if (j.contains(kFloatParams[i].key) && j[kFloatParams[i].key].is_number()) {
+            initVal = j[kFloatParams[i].key].get<float>();
+        } else {
+            // 从 defaults 推断
+            switch (i) {
+                case 0: initVal = defaults.triggerThreshold; break;
+                case 1: initVal = defaults.maxPeak; break;
+                case 2: initVal = defaults.maxVol; break;
+                case 3: initVal = defaults.minTargetVol; break;
+                case 4: initVal = defaults.attackAlphaMin; break;
+                case 5: initVal = defaults.attackAlphaMax; break;
+                case 6: initVal = defaults.releaseAlpha; break;
+                case 7: initVal = defaults.floorHoldSec; break;
+                case 8: initVal = defaults.pollInterval; break;
+            }
+        }
+        initVal = std::clamp(initVal, kFloatParams[i].min, kFloatParams[i].max);
+
+        HWND hSlider = CreateWindowExW(
+            0, TRACKBAR_CLASSW, L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_HORZ | TBS_AUTOTICKS,
+            sliderX, rowY + 2, SLIDER_W, ROW_H - 2,
+            hwnd, (HMENU)(UINT_PTR)(ID_SLIDER_FLOAT_BASE + i),
+            GetModuleHandleW(nullptr), nullptr);
+        SendMessageW(hSlider, TBM_SETRANGE, TRUE, MAKELPARAM(0, scale));
+        SendMessageW(hSlider, TBM_SETPOS, TRUE,
+                     sliderValueToPos(initVal, kFloatParams[i].min, kFloatParams[i].max));
+
+        // Edit
+        HWND hEdit = CreateWindowExW(
+            WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | ES_LEFT | ES_AUTOHSCROLL,
+            editX, rowY + 2, EDIT_W, ROW_H - 2,
+            hwnd, (HMENU)(UINT_PTR)(ID_EDIT_FLOAT_BASE + i),
+            GetModuleHandleW(nullptr), nullptr);
+        setEditTextUtf8(hEdit, floatToString(initVal));
+
+        // 拦截回车
+        SetWindowSubclass(hEdit, EditSubclassProc, 0, (DWORD_PTR)i);
+    }
+
+    // ── TARGET_MUSIC_APPS 标签 ──
+    CreateWindowExW(
+        0, L"STATIC", L"TARGET_MUSIC_APPS (每行一个, 子串匹配)",
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        MARGIN, appsY, rowW - 2 * MARGIN, appsLabelH,
+        hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
 
     // ── TARGET_MUSIC_APPS (多行 Edit) ──
     CreateWindowExW(
         WS_EX_CLIENTEDGE, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL,
-        margin, appsY, rowW - 2 * margin, appsH,
+        MARGIN, appsEditY, rowW - 2 * MARGIN, APPS_H,
         hwnd, (HMENU)(UINT_PTR)ID_EDIT_APPS,
         GetModuleHandleW(nullptr), nullptr);
     {
@@ -282,53 +419,42 @@ void CreateSettingsWindow() {
         setEditTextUtf8(hApps, joined);
     }
 
-    // ── 9 个浮点参数 ──
-    struct FloatSlot { UINT editId; const char* key; float defVal; };
-    FloatSlot slots[] = {
-        {ID_EDIT_FLOAT_BASE + 0, "TRIGGER_THRESHOLD", defaults.triggerThreshold},
-        {ID_EDIT_FLOAT_BASE + 1, "MAX_PEAK",          defaults.maxPeak},
-        {ID_EDIT_FLOAT_BASE + 2, "MAX_VOL",           defaults.maxVol},
-        {ID_EDIT_FLOAT_BASE + 3, "MIN_TARGET_VOL",    defaults.minTargetVol},
-        {ID_EDIT_FLOAT_BASE + 4, "ATTACK_ALPHA_MIN",  defaults.attackAlphaMin},
-        {ID_EDIT_FLOAT_BASE + 5, "ATTACK_ALPHA_MAX",  defaults.attackAlphaMax},
-        {ID_EDIT_FLOAT_BASE + 6, "RELEASE_ALPHA",     defaults.releaseAlpha},
-        {ID_EDIT_FLOAT_BASE + 7, "FLOOR_HOLD_SEC",    defaults.floorHoldSec},
-        {ID_EDIT_FLOAT_BASE + 8, "POLL_INTERVAL",     defaults.pollInterval},
-    };
-
-    for (size_t i = 0; i < kFloatParamCount; ++i) {
-        int rowY = floatStartY + (int)i * rowH;
-        // Label
-        std::wstring lblW = utf8ToWide(kFloatParams[i].label);
-        CreateWindowExW(
-            0, L"STATIC", lblW.c_str(),
-            WS_CHILD | WS_VISIBLE | SS_LEFT,
-            margin, rowY + 4, labelW, rowH - 4,
-            hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
-        // Edit
-        HWND hEdit = CreateWindowExW(
-            WS_EX_CLIENTEDGE, L"EDIT", L"",
-            WS_CHILD | WS_VISIBLE | ES_LEFT | ES_AUTOHSCROLL,
-            editX, rowY, editW, rowH - 4,
-            hwnd, (HMENU)(UINT_PTR)slots[i].editId,
-            GetModuleHandleW(nullptr), nullptr);
-        fillEditFromConfigOrJson(hEdit, slots[i].key, j, slots[i].defVal);
-    }
-
     // ── 保存 / 取消 按钮 ──
-    int btnW = 90;
     CreateWindowExW(
         0, L"BUTTON", L"保存",
         WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-        rowW - margin - 2 * btnW - 8, btnY, btnW, btnH,
+        rowW - MARGIN - 2 * BTN_W - 8, btnY, BTN_W, BTN_H,
         hwnd, (HMENU)(UINT_PTR)ID_BTN_SAVE,
         GetModuleHandleW(nullptr), nullptr);
     CreateWindowExW(
         0, L"BUTTON", L"取消",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        rowW - margin - btnW, btnY, btnW, btnH,
+        rowW - MARGIN - BTN_W, btnY, BTN_W, BTN_H,
         hwnd, (HMENU)(UINT_PTR)ID_BTN_CANCEL,
         GetModuleHandleW(nullptr), nullptr);
+
+    // ── 底部状态栏 (SS_LEFTNOWORDWRAP, 等宽字体) ──
+    HWND hStatusBar = CreateWindowExW(
+        WS_EX_STATICEDGE, L"STATIC", L"",
+        WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP | SS_NOPREFIX,
+        MARGIN, statusBarY, rowW - 2 * MARGIN, STATUS_BAR_H - 6,
+        hwnd, (HMENU)(UINT_PTR)ID_STATUS_BAR,
+        GetModuleHandleW(nullptr), nullptr);
+
+    // 等宽字体 (Consolas, 失败回退 system fixed)
+    HFONT hMono = CreateFontW(
+        -14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, FF_MODERN | FIXED_PITCH, L"Consolas");
+    if (!hMono) {
+        hMono = (HFONT)GetStockObject(SYSTEM_FIXED_FONT);
+    }
+    if (hMono) {
+        SendMessageW(hStatusBar, WM_SETFONT, (WPARAM)hMono, TRUE);
+    }
+
+    // 初始化按钮文字 (避免 WM_TIMER 兜底前的瞬间空白)
+    RefreshEnableVisuals(hwnd);
 }
 
 // ───── 收集并校验所有输入 ─────
@@ -468,6 +594,87 @@ void SaveJson(const ParsedValues& pv) {
 // ───── 设置窗口 WndProc ─────
 LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+    case WM_CREATE: {
+        // 100ms 定时器, 刷新按钮文字 + 状态栏文本
+        SetTimer(hwnd, ID_TIMER_REFRESH, 100, nullptr);
+        return 0;
+    }
+
+    case WM_TIMER: {
+        if (wParam == ID_TIMER_REFRESH) {
+            RefreshEnableVisuals(hwnd);   // 刷新按钮文字 + 状态标签 (redraw)
+            HWND hBar = GetDlgItem(hwnd, ID_STATUS_BAR);
+            if (hBar) {
+                SetWindowTextW(hBar, UI::getLiveStatus().c_str());
+            }
+        }
+        return 0;
+    }
+
+    case WM_APP_COMMIT_PARAM: {
+        size_t idx = (size_t)wParam;
+        if (idx >= kFloatParamCount) return 0;
+        HWND hEdit = GetDlgItem(hwnd, (int)(ID_EDIT_FLOAT_BASE + idx));
+        HWND hSlider = GetDlgItem(hwnd, (int)(ID_SLIDER_FLOAT_BASE + idx));
+        auto v = parseFloat(getEditTextUtf8(hEdit));
+        if (!v) {
+            std::ostringstream oss;
+            oss << kFloatParams[idx].key << ": 不是有效数字 \"" << getEditTextUtf8(hEdit) << "\"";
+            MessageBoxW(hwnd, utf8ToWide(oss.str()).c_str(),
+                        L"参数错误", MB_OK | MB_ICONWARNING);
+            SetFocus(hEdit);
+            return 0;
+        }
+        float clamped = std::clamp(*v, kFloatParams[idx].min, kFloatParams[idx].max);
+        int pos = sliderValueToPos(clamped, kFloatParams[idx].min, kFloatParams[idx].max);
+        SendMessageW(hSlider, TBM_SETPOS, TRUE, pos);
+        setEditTextUtf8(hEdit, floatToString(clamped));
+        return 0;
+    }
+
+    case WM_APP_REFRESH_UI: {
+        RefreshEnableVisuals(hwnd);
+        return 0;
+    }
+
+    case WM_HSCROLL: {
+        HWND hSlider = (HWND)lParam;
+        int ctrlId = GetDlgCtrlID(hSlider);
+        if (ctrlId >= (int)ID_SLIDER_FLOAT_BASE &&
+            ctrlId < (int)(ID_SLIDER_FLOAT_BASE + kFloatParamCount)) {
+            size_t idx = (size_t)(ctrlId - ID_SLIDER_FLOAT_BASE);
+            int pos = (int)SendMessageW(hSlider, TBM_GETPOS, 0, 0);
+            float val = sliderPosToValue(pos, kFloatParams[idx].min, kFloatParams[idx].max);
+            HWND hEdit = GetDlgItem(hwnd, (int)(ID_EDIT_FLOAT_BASE + idx));
+            setEditTextUtf8(hEdit, floatToString(val));
+        }
+        return 0;
+    }
+
+    case WM_DRAWITEM: {
+        auto* dis = (DRAWITEMSTRUCT*)lParam;
+        if (dis->CtlID == ID_STATUS_LABEL) {
+            bool active = UI::enabled.load();
+            COLORREF bg = active ? RGB(0, 150, 0) : RGB(180, 180, 180);
+            HBRUSH br = CreateSolidBrush(bg);
+            FillRect(dis->hDC, &dis->rcItem, br);
+            DeleteObject(br);
+            SetTextColor(dis->hDC, active ? RGB(255, 255, 255) : RGB(40, 40, 40));
+            SetBkMode(dis->hDC, TRANSPARENT);
+            const wchar_t* txt = active ? L" ● 激活中 " : L" ○ 已暂停 ";
+            RECT rc = dis->rcItem;
+            DrawTextW(dis->hDC, txt, -1, &rc,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            return TRUE;
+        }
+        return 0;
+    }
+
+    case WM_CTLCOLORSTATIC: {
+        // 状态栏 (ID_STATUS_BAR) 与普通 label 不需要特殊着色; 让默认处理即可
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+
     case WM_COMMAND: {
         WORD code = HIWORD(wParam);
         WORD id   = LOWORD(wParam);
@@ -489,10 +696,9 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             DestroyWindow(hwnd);
             return 0;
         }
-        if (id == ID_CHECK_ENABLED && code == BN_CLICKED) {
-            HWND hCheck = (HWND)lParam;
-            bool on = (SendMessageW(hCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
-            UI::enabled.store(on);
+        if (id == ID_BTN_TOGGLE && code == BN_CLICKED) {
+            UI::enabled.store(!UI::enabled.load());
+            RefreshEnableVisuals(hwnd);
             return 0;
         }
         return 0;
@@ -504,6 +710,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         return 0;
 
     case WM_DESTROY: {
+        KillTimer(hwnd, ID_TIMER_REFRESH);
         // 释放注入的 json
         auto* pj = (nlohmann::json*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -563,6 +770,20 @@ void RemoveTrayIcon(HWND hwnd) {
 }
 
 } // anonymous namespace
+
+// ───── 跨线程状态栏接口 ─────
+std::mutex UI::liveStatusMutex;
+std::wstring UI::liveStatusText;
+
+void UI::setLiveStatus(const std::wstring& w) {
+    std::lock_guard<std::mutex> lock(liveStatusMutex);
+    liveStatusText = w;
+}
+
+std::wstring UI::getLiveStatus() {
+    std::lock_guard<std::mutex> lock(liveStatusMutex);
+    return liveStatusText;
+}
 
 // ───── 线程入口 ─────
 int UI::runMessageLoop() {

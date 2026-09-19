@@ -96,6 +96,18 @@ std::pair<std::vector<AudioSession>, float> AudioScanner::scan(
                 s.processName = std::move(name);
                 s.volume      = std::move(vol);
                 s.meter       = std::move(meter);
+
+                // 首次见到该 pid → 记录其原始音量 (GetMasterVolume)
+                auto [it, inserted] = originalVolumes_.try_emplace(s.processId);
+                if (inserted) {
+                    float cur = 1.0f;
+                    if (s.volume) {
+                        if (FAILED(s.volume->GetMasterVolume(&cur))) cur = 1.0f;
+                    }
+                    it->second = cur;
+                }
+                s.originalVolume = it->second;
+
                 music.push_back(std::move(s));
             }
         } else if (peak > maxOtherPeak) {
@@ -104,6 +116,24 @@ std::pair<std::vector<AudioSession>, float> AudioScanner::scan(
     }
 
     return {std::move(music), maxOtherPeak};
+}
+
+size_t AudioScanner::restoreOriginalVolumes(const std::vector<AudioSession>& sessions) {
+    size_t count = 0;
+    for (const auto& s : sessions) {
+        auto it = originalVolumes_.find(s.processId);
+        if (it == originalVolumes_.end()) continue;
+        if (s.volume) {
+            s.volume->SetMasterVolume(it->second, nullptr);
+            ++count;
+        }
+    }
+    originalVolumes_.clear();
+    return count;
+}
+
+void AudioScanner::clearVolumeCache() {
+    originalVolumes_.clear();
 }
 
 }  // namespace duck
