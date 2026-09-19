@@ -1,0 +1,87 @@
+# ============================================================
+# .gitignore for Audio_Ducking (C++ / CMake / MSVC / VSCode)
+# ============================================================
+
+# ───── CMake 构建输出 ─────
+out/
+build/
+cmake-build-*/
+
+# CMake 中间产物
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+_deps/
+CMakeUserPresets.json
+compile_commands.json
+
+# Ninja
+.ninja_deps
+.ninja_log
+build.ninja
+rules.ninja
+
+# ───── MSVC / Visual Studio 构建产物 ─────
+*.exe
+*.obj
+*.o
+*.lib
+*.dll
+*.pdb          # vc140.pdb 等
+*.ilk
+*.exp
+*.idb
+*.ipdb
+*.pch
+*.tmp_proj
+*.log
+
+# MSVC 根目录杂项 (源树里残留的 vc140.pdb 等)
+vc*.pdb
+
+# Visual Studio 工程缓存 / IDE 状态
+.vs/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.suo
+*.sdf
+*.opensdf
+*.cachefile
+ipch/
+*.dbmdl
+*.dbproj.schemaview
+*.jfm
+*.pfx
+*.publishstate
+
+# VS 用户选项
+.vscode/launch.json.bak
+
+# ───── Windows 系统垃圾 ─────
+Thumbs.db
+ehthumbs.db
+ehthumbs_view.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# macOS (跨平台开发者常见)
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# ───── 编辑器临时 ─────
+*.swp
+*.swo
+*~
+.vscode/.cache/
+
+# ───── 日志 / 临时输出 ─────
+*.log
+*.tmp
+*.bak

@@ -1,0 +1,25 @@
+{
+    "_comment_doc": "═══════════════════════════════════════════════════════════════",
+    "_comment_about": "Audio Ducking 运行时配置 — 修改后下次循环自动热加载, 无需重启。",
+    "_comment_about2": "字段名/类型/含义请参考 Config.h 的 Config 结构体 (单点真相)。",
+
+    "_comment_target": "─── 目标进程识别 (字符串列表, 大小写不敏感) ───",
+    "TARGET_MUSIC_APPS": ["cloudmusic", "qqmusic", "spotify", "foobar2000"],
+
+    "_comment_trigger": "─── 触发参数 (音频侧, 0.0~1.0) ───",
+    "TRIGGER_THRESHOLD": 0.02,
+    "MAX_PEAK":          0.10,
+
+    "_comment_volume": "─── 音量参数 (0.0~1.0) ───",
+    "MAX_VOL":           1.0,
+    "MIN_TARGET_VOL":    0.20,
+
+    "_comment_alpha": "─── Alpha (淡入淡出速度, 0~1) ───",
+    "ATTACK_ALPHA_MIN":  0.08,
+    "ATTACK_ALPHA_MAX":  0.35,
+    "RELEASE_ALPHA":     0.03,
+
+    "_comment_timing": "─── 时序参数 ───",
+    "FLOOR_HOLD_SEC":    10.0,
+    "POLL_INTERVAL":     0.02
+}
