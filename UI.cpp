@@ -83,13 +83,14 @@ constexpr int SLIDER_W      = 320;
 constexpr int EDIT_W        = 110;
 
 // 目标窗口尺寸
-constexpr int WINDOW_W      = 740;
+constexpr int WINDOW_W      = 880;
 constexpr int WINDOW_H      = 580;
 
 // 配色
-constexpr COLORREF CLR_BG_DARK   = RGB(30, 30, 30);     // #1E1E1E
-constexpr COLORREF CLR_TEXT_HI   = RGB(220, 220, 220);
-constexpr COLORREF CLR_STATUS_OK = RGB(160, 230, 160);
+constexpr COLORREF CLR_BG_DARK     = RGB(30, 30, 30);     // #1E1E1E — 旧窗口画刷 (保留)
+constexpr COLORREF CLR_BG_PANEL    = RGB(45, 45, 48);     // #2D2D30 — 稍亮的暗灰, 用于窗口/编辑框背景
+constexpr COLORREF CLR_TEXT_HI     = RGB(220, 220, 220);
+constexpr COLORREF CLR_STATUS_OK   = RGB(160, 230, 160);
 
 constexpr LPCWSTR kMainWndClass   = L"AudioDuckingMainWnd";
 constexpr LPCWSTR kSettingsClass  = L"AudioDuckingSettingsWnd";
@@ -97,12 +98,14 @@ constexpr LPCWSTR kSettingsTitle  = L"Audio Ducking — 设置";
 constexpr LPCWSTR kMainWndTitle   = L"AudioDucking";
 
 // ───── 现代资源 (字体 / GDI+ token / 暗画刷) ─────
-HFONT       g_hFont       = nullptr;  // Segoe UI 9pt
-HFONT       g_hFontBold   = nullptr;  // Segoe UI Semibold 9pt
-HFONT       g_hFontSmall  = nullptr;  // Segoe UI 8pt
-HFONT       g_hFontMono   = nullptr;  // Consolas 9pt (状态栏)
+HFONT       g_hFont        = nullptr;  // Segoe UI 9pt
+HFONT       g_hFontBold    = nullptr;  // Segoe UI Semibold 9pt
+HFONT       g_hFontSmall   = nullptr;  // Segoe UI 8pt
+HFONT       g_hFontMono    = nullptr;  // Consolas 8.5pt (状态栏)
 ULONG_PTR   g_gdiplusToken = 0;
-HBRUSH      g_hDarkBrush  = nullptr;  // WM_CTLCOLORSTATIC 用
+HBRUSH      g_hDarkBrush   = nullptr;  // WM_CTLCOLORSTATIC 用 (#1E1E1E)
+HBRUSH      g_hEditBgBrush = nullptr;  // WM_CTLCOLOREDIT 用 (#2D2D30)
+HBRUSH      g_hBgBrush     = nullptr;  // WM_ERASEBKGND 用 (#2D2D30, 整窗背景)
 
 void InitModernResources() {
     // GDI+ (用于自定义绘状态指示器)
@@ -125,20 +128,26 @@ void InitModernResources() {
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
     g_hFontMono = CreateFontW(
-        -15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        -14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         FIXED_PITCH | FF_MODERN, L"Consolas");
 
     // 暗背景画刷 (WM_CTLCOLORSTATIC 用)
     g_hDarkBrush = CreateSolidBrush(CLR_BG_DARK);
+    // 编辑框背景 (#2D2D30)
+    g_hEditBgBrush = CreateSolidBrush(CLR_BG_PANEL);
+    // 整窗背景 (#2D2D30, 比 #1E1E1E 稍亮, 避免被主题覆盖后显得死黑)
+    g_hBgBrush = CreateSolidBrush(CLR_BG_PANEL);
 }
 
 void CleanupModernResources() {
-    if (g_hFont)      { DeleteObject(g_hFont);      g_hFont = nullptr; }
-    if (g_hFontBold)  { DeleteObject(g_hFontBold);  g_hFontBold = nullptr; }
-    if (g_hFontSmall) { DeleteObject(g_hFontSmall); g_hFontSmall = nullptr; }
-    if (g_hFontMono)  { DeleteObject(g_hFontMono);  g_hFontMono = nullptr; }
-    if (g_hDarkBrush) { DeleteObject(g_hDarkBrush); g_hDarkBrush = nullptr; }
+    if (g_hFont)        { DeleteObject(g_hFont);        g_hFont = nullptr; }
+    if (g_hFontBold)    { DeleteObject(g_hFontBold);    g_hFontBold = nullptr; }
+    if (g_hFontSmall)   { DeleteObject(g_hFontSmall);   g_hFontSmall = nullptr; }
+    if (g_hFontMono)    { DeleteObject(g_hFontMono);    g_hFontMono = nullptr; }
+    if (g_hDarkBrush)   { DeleteObject(g_hDarkBrush);   g_hDarkBrush = nullptr; }
+    if (g_hEditBgBrush) { DeleteObject(g_hEditBgBrush); g_hEditBgBrush = nullptr; }
+    if (g_hBgBrush)     { DeleteObject(g_hBgBrush);     g_hBgBrush = nullptr; }
     if (g_gdiplusToken) {
         Gdiplus::GdiplusShutdown(g_gdiplusToken);
         g_gdiplusToken = 0;
@@ -459,6 +468,8 @@ void CreateSettingsWindow() {
         SendMessageW(hSlider, TBM_SETRANGE, TRUE, MAKELPARAM(0, scale));
         SendMessageW(hSlider, TBM_SETPOS, TRUE,
                      sliderValueToPos(sliderVal, kFloatParams[i].min, kFloatParams[i].sliderMax));
+        // 加宽滑块 (覆盖深色主题下细线"channel"伪影, 让 thumb 更显眼)
+        SendMessageW(hSlider, TBM_SETTHUMBLENGTH, 18, 0);
         ApplyModernThemeToControl(hSlider);
 
         // Edit (v6 视觉样式 + Segoe UI)
@@ -470,7 +481,9 @@ void CreateSettingsWindow() {
             GetModuleHandleW(nullptr), nullptr);
         setEditTextUtf8(hEdit, floatToString(initVal));
         ApplyModernFontToControl(hEdit);
-        ApplyModernThemeToControl(hEdit);
+        // 编辑框: 不应用 DarkMode_Explorer 主题 (Win11 下该主题不会把它正确着色,
+        // 导致黑字黑底). 改为禁用主题, 颜色完全由 WM_CTLCOLOREDIT 控制.
+        SetWindowTheme(hEdit, L"", nullptr);
 
         // 拦截回车
         SetWindowSubclass(hEdit, EditSubclassProc, 0, (DWORD_PTR)i);
@@ -495,7 +508,7 @@ void CreateSettingsWindow() {
     };
     makeButton(ID_BTN_CANCEL, L"取消", BS_PUSHBUTTON,    cancelX);
     makeButton(ID_BTN_SAVE,   L"保存", BS_PUSHBUTTON,    saveX);
-    makeButton(ID_BTN_APPLY,  L"应用", BS_DEFPUSHBUTTON, applyX);
+    makeButton(ID_BTN_APPLY,  L"应用", BS_PUSHBUTTON,    applyX);
 
     // ── 底部状态栏 (SS_LEFTNOWORDWRAP, Consolas 9pt, 暗主题) ──
     int statusBarY = btnY + BTN_H + 22;
@@ -741,6 +754,26 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         return (LRESULT)g_hDarkBrush;
     }
 
+    case WM_CTLCOLOREDIT: {
+        // 暗主题: DarkMode_Explorer 在 Win11 下未对 EDIT 控件做主题化,
+        // 导致文字/背景都是默认系统色 (在深色窗口里 = 黑字黑底, 看不见).
+        // 这里强制设置浅文字 + 深背景, 并返回缓存画刷.
+        HDC hdc = (HDC)wParam;
+        SetTextColor(hdc, RGB(220, 220, 220));
+        SetBkColor(hdc, CLR_BG_PANEL);
+        return (LRESULT)g_hEditBgBrush;
+    }
+
+    case WM_ERASEBKGND: {
+        // 视觉主题在 Win11 上会覆盖窗口类注册时的 hbrBackground,
+        // 导致窗口背景接近全黑. 这里手动填充 #2D2D30.
+        HDC hdc = (HDC)wParam;
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        FillRect(hdc, &rc, g_hBgBrush);
+        return 1;  // 我们已擦除
+    }
+
     case WM_COMMAND: {
         WORD code = HIWORD(wParam);
         WORD id   = LOWORD(wParam);
@@ -811,8 +844,9 @@ bool RegisterWindowClasses() {
     wcs.lpfnWndProc   = SettingsWndProc;
     wcs.hInstance     = GetModuleHandleW(nullptr);
     wcs.lpszClassName = kSettingsClass;
-    // 暗色背景画刷 (#1E1E1E) — 与窗口级 DWM 暗标题栏协调
-    wcs.hbrBackground = CreateSolidBrush(CLR_BG_DARK);
+    // 不在类注册时设置 hbrBackground (Win11 视觉主题会把它覆盖成近黑).
+    // 改为在 SettingsWndProc 的 WM_ERASEBKGND 中显式绘制 #2D2D30.
+    wcs.hbrBackground = NULL;
     wcs.hIcon         = LoadIconW(nullptr, (LPCWSTR)IDI_APPLICATION);
     wcs.hCursor       = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
     if (!RegisterClassExW(&wcs)) return false;
